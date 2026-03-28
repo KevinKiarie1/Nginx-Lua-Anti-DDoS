@@ -1,0 +1,205 @@
+// ============================================================
+// PRISMA SCHEMA — CP-SOCIAL-BOT-FLEET-MODULAR
+// ============================================================
+//
+// Database: CockroachDB (CP-consistent, SERIALIZABLE by default)
+//
+// CAP Design Decisions:
+// - CockroachDB uses Raft consensus → every committed write is
+//   replicated to a majority of nodes before acknowledgment.
+// - All transactions default to SERIALIZABLE isolation.
+// - We sacrifice Availability during network partitions:
+//   operations that cannot reach quorum will fail rather than
+//   return stale data.
+//
+// To switch to PostgreSQL, change provider to "postgresql" and
+// add advisory locks + explicit SERIALIZABLE isolation to all
+// critical transactions.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "cockroachdb"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────
+
+enum Platform {
+  TELEGRAM
+  TIKTOK
+  INSTAGRAM
+  FACEBOOK
+}
+
+enum TaskType {
+  SEND_MESSAGE
+  POST_CONTENT
+  SEND_DM
+  LIKE_POST
+  COMMENT
+  FOLLOW_USER
+  UNFOLLOW_USER
+  SCRAPE_USERS
+  SCHEDULE_POST
+}
+
+enum TaskStatus {
+  PENDING
+  CLAIMED
+  RUNNING
+  COMPLETED
+  FAILED
+  DEAD_LETTER
+}
+
+// ── Models ───────────────────────────────────────────────────
+
+/// Stores encrypted credentials for each social-media account.
+/// One account = one platform + one set of credentials.
+/// Credentials are AES-256-GCM encrypted at rest.
+model Account {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  platform             Platform
+  username             String
+  /// AES-256-GCM encrypted JSON blob containing platform-specific credentials
+  encryptedCredentials String
+  /// Optional metadata (proxy preference, notes, etc.)
+  metadata             Json?
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  tasks Task[]
+
+  @@unique([platform, username])
+  @@index([platform, isActive])
+}
+
+/// DB-backed task queue entry. Replaces Redis/BullMQ to maintain
+/// CP consistency — every task state transition is a SERIALIZABLE
+/// transaction that CockroachDB replicates via Raft.
+///
+/// Task Lifecycle:
+///   PENDING → CLAIMED → RUNNING → COMPLETED
+///                                → FAILED → PENDING (retry)
+///                                → DEAD_LETTER (max retries exceeded)
+model Task {
+  id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type           TaskType
+  platform       Platform
+  status         TaskStatus @default(PENDING)
+  /// Idempotency key — prevents duplicate task creation
+  idempotencyKey String?    @unique
+  /// JSON payload specific to the task type
+  payload        Json
+  /// Result data (set on COMPLETED)
+  result         Json?
+  /// Error message (set on FAILED)
+  errorMessage   String?
+  /// Number of retry attempts so far
+  retryCount     Int        @default(0)
+  maxRetries     Int        @default(3)
+  /// Which worker instance claimed this task
+  claimedBy      String?
+  claimedAt      DateTime?
+  /// Lease expiration for the current worker claim
+  leaseExpiresAt DateTime?
+  /// Last heartbeat from the worker currently executing this task
+  workerHeartbeatAt DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  /// Priority (lower number = higher priority)
+  priority       Int        @default(100)
+
+  accountId String?  @db.Uuid
+  account   Account? @relation(fields: [accountId], references: [id])
+
+  @@index([status, platform, priority])
+  @@index([claimedBy, status])
+  @@index([status, claimedAt])
+  @@index([status, leaseExpiresAt])
+}
+
+/// Cron-like schedule stored in the DB for strong consistency.
+/// Only the leader node evaluates schedules (prevents duplicate
+/// task creation across multiple instances).
+model Schedule {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  /// Cron expression (e.g. "0 0/6 * * *")
+  cronExpr  String
+  platform  Platform
+  taskType  TaskType
+  /// JSON payload template for generated tasks
+  payload   Json
+  accountId String?  @db.Uuid
+  isActive  Boolean  @default(true)
+  lastRunAt DateTime?
+  nextRunAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, nextRunAt])
+}
+
+/// Audit trail of every post/action executed.
+model PostHistory {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  platform   Platform
+  taskType   TaskType
+  accountId  String   @db.Uuid
+  /// Reference to the original task
+  taskId     String   @db.Uuid
+  /// Platform-specific result data
+  resultData Json?
+  createdAt  DateTime @default(now())
+
+  @@index([platform, accountId])
+  @@index([taskId])
+}
+
+/// Rate-limit events for per-platform throttling.
+/// Stored in DB (not in-memory) so all instances share
+/// the same rate-limit state — CP consistency requirement.
+model RateLimitEvent {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  platform  Platform
+  accountId String?  @db.Uuid
+  eventType String
+  createdAt DateTime @default(now())
+
+  @@index([platform, createdAt])
+  @@index([platform, accountId, createdAt])
+}
+
+/// Cluster node registry for leader election and health monitoring.
+/// Each running instance registers here and sends periodic heartbeats.
+/// Used to determine cluster quorum and elect a single leader for
+/// scheduled task evaluation.
+model ClusterNode {
+  id            String   @id
+  lastHeartbeat DateTime @default(now())
+  isLeader      Boolean  @default(false)
+  startedAt     DateTime @default(now())
+  metadata      Json?
+
+  @@index([isLeader])
+  @@index([lastHeartbeat])
+}
+
+/// Singleton lease rows used for leader election and other cluster-wide locks.
+model ClusterLease {
+  name       String   @id
+  ownerId    String
+  leaseUntil DateTime
+  updatedAt  DateTime @updatedAt
+  metadata   Json?
+
+  @@index([leaseUntil])
+}

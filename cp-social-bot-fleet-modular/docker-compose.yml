@@ -1,0 +1,56 @@
+# ============================================================
+# Docker Compose — CP-SOCIAL-BOT-FLEET-MODULAR
+# ============================================================
+# Runs:
+# 1. CockroachDB single-node (CP-consistent database)
+# 2. The NestJS modular monolith (API + task dispatcher)
+#
+# CockroachDB provides SERIALIZABLE isolation by default and
+# uses Raft consensus for all writes — this is the foundation
+# of our CP guarantees.
+# ============================================================
+
+version: '3.9'
+
+services:
+  # ── CockroachDB — CP-Consistent Database ─────────────────
+  cockroachdb:
+    image: cockroachdb/cockroach:v23.2.0
+    command: start-single-node --insecure --store=attrs=ssd,path=/cockroach/cockroach-data
+    ports:
+      - '26257:26257'  # SQL port
+      - '8080:8080'    # Admin UI
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8080/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - botnet
+
+  # ── NestJS Modular Monolith ──────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      cockroachdb:
+        condition: service_healthy
+    ports:
+      - '3000:3000'
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: 'postgresql://root@cockroachdb:26257/social_bot_fleet?sslmode=disable'
+    restart: unless-stopped
+    networks:
+      - botnet
+
+volumes:
+  cockroach-data:
+
+networks:
+  botnet:
+    driver: bridge

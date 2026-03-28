@@ -1,0 +1,6 @@
+{
+  "python.envFile": "${workspaceFolder}/cp-social-bot-fleet/.env",
+  "python.terminal.useEnvFile": true,
+  "typescript.tsdk": "cp-social-bot-fleet/node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true
+}
