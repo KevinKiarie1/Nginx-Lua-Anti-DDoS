@@ -22,7 +22,10 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Platform } from '@prisma/client';
-import { TaskQueueService } from '../core/queue/task-queue.service';
+import {
+  TaskLeaseOwnershipError,
+  TaskQueueService,
+} from '../core/queue/task-queue.service';
 import { ConsistencyService } from '../core/consistency/consistency.service';
 import { HandlerRegistryService } from '../core/registry/handler-registry.service';
 import { RateLimiterService } from '../core/rate-limiter/rate-limiter.service';
@@ -109,7 +112,7 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
   private async poll(): Promise<void> {
     // CP Gate: Skip if cluster is not healthy
     try {
-      this.consistency.requireHealthy();
+      await this.consistency.requireHealthy();
     } catch {
       this.logger.debug('Skipping poll — cluster not healthy');
       return;
@@ -131,6 +134,7 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
   private async executeTask(taskId: string): Promise<void> {
     this.activeTasks++;
     let leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
+    let leaseOwnershipLost = false;
 
     try {
       await this.queue.markTaskRunning(taskId);
@@ -140,9 +144,14 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
           .renewTaskLease(taskId)
           .then((renewed) => {
             if (!renewed) {
+              leaseOwnershipLost = true;
               this.logger.warn(
                 `Lease renewal skipped for task ${taskId} — ownership lost`,
               );
+              if (leaseRenewTimer) {
+                clearInterval(leaseRenewTimer);
+                leaseRenewTimer = null;
+              }
             }
           })
           .catch((error) => {
@@ -166,6 +175,12 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
         task.accountId ?? undefined,
       );
       if (!allowed) {
+        if (leaseOwnershipLost) {
+          this.logger.warn(
+            `Discarding rate-limit retry for task ${taskId} after lease loss`,
+          );
+          return;
+        }
         await this.queue.markTaskFailed(
           taskId,
           'Rate limited — will retry',
@@ -199,6 +214,13 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
         ),
       ]);
 
+      if (leaseOwnershipLost) {
+        this.logger.warn(
+          `Discarding result for task ${taskId} because lease ownership was lost`,
+        );
+        return;
+      }
+
       if (result.success) {
         await this.queue.markTaskCompleted(taskId, result.data);
       } else {
@@ -208,12 +230,21 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
         );
       }
     } catch (error) {
+      if (error instanceof TaskLeaseOwnershipError) {
+        this.logger.warn(error.message);
+        return;
+      }
+
       const msg = error instanceof Error ? error.message : String(error);
       this.logger.error(`Task ${taskId} failed: ${msg}`);
       const retryable = msg !== 'Task timed out';
       await this.queue
         .markTaskFailed(taskId, msg, { retryable })
-        .catch(() => {});
+        .catch((markError) => {
+          if (markError instanceof TaskLeaseOwnershipError) {
+            this.logger.warn(markError.message);
+          }
+        });
     } finally {
       if (leaseRenewTimer) {
         clearInterval(leaseRenewTimer);

@@ -37,6 +37,21 @@ export enum ClusterHealth {
   PARTITIONED = 'PARTITIONED',
 }
 
+export interface ClusterHealthSnapshot {
+  health: ClusterHealth;
+  checkedAt: Date;
+  databaseReachable: boolean;
+  writeSafe: boolean;
+  selfRegistered: boolean;
+  aliveNodeCount: number;
+  requiredNodeCount: number;
+  nodeQuorumMet: boolean;
+  schedulerLeaseOwnerId: string | null;
+  schedulerLeaseExpiresAt: Date | null;
+  schedulerReady: boolean;
+  isLeader: boolean;
+}
+
 @Injectable()
 export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
   private static readonly SCHEDULER_LEASE = 'scheduler';
@@ -45,6 +60,7 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private currentHealth: ClusterHealth = ClusterHealth.PARTITIONED;
   private isLeader = false;
+  private healthSnapshot: ClusterHealthSnapshot;
 
   private readonly instanceId: string;
   private readonly heartbeatIntervalMs: number;
@@ -63,34 +79,39 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
     this.nodeTimeoutMs = this.config.get<number>('app.clusterNodeTimeoutMs')!;
     this.leaderLeaseMs = this.config.get<number>('app.clusterLeaderLeaseMs')!;
     this.minNodes = this.config.get<number>('app.clusterMinNodes')!;
+    this.healthSnapshot = this.createPartitionedSnapshot();
   }
 
   async onModuleInit() {
     await this.registerNode();
     this.startHeartbeat();
     // Initial health check after a brief delay for DB stabilization
-    setTimeout(() => this.checkHealth(), 2000);
+    setTimeout(() => {
+      void this.sendHeartbeat();
+    }, 2000);
   }
 
   async onModuleDestroy() {
     this.stopHeartbeat();
-    await this.releaseLeadership();
+    await this.releaseLeadership().catch((error) => {
+      this.logger.warn('Failed to release leadership during shutdown', error);
+    });
   }
 
   // ── Node Registration ──────────────────────────────────
 
   /** Register this instance in the cluster node table */
-  async registerNode(): Promise<void> {
+  async registerNode(now = new Date()): Promise<void> {
     await this.prisma.clusterNode.upsert({
       where: { id: this.instanceId },
       update: {
-        lastHeartbeat: new Date(),
+        lastHeartbeat: now,
         metadata: { pid: process.pid },
       },
       create: {
         id: this.instanceId,
-        lastHeartbeat: new Date(),
-        startedAt: new Date(),
+        lastHeartbeat: now,
+        startedAt: now,
         metadata: { pid: process.pid },
       },
     });
@@ -102,29 +123,31 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
   /** Send a heartbeat, clean stale nodes, refresh health, and attempt leader election */
   async sendHeartbeat(): Promise<void> {
     try {
-      // Update our heartbeat timestamp
-      await this.prisma.clusterNode.update({
-        where: { id: this.instanceId },
-        data: { lastHeartbeat: new Date() },
-      });
+      const now = new Date();
+
+      await this.registerNode(now);
 
       // Remove nodes that haven't sent a heartbeat within the timeout
-      const cutoff = new Date(Date.now() - this.nodeTimeoutMs);
+      const cutoff = new Date(now.getTime() - this.nodeTimeoutMs);
       await this.prisma.clusterNode.deleteMany({
-        where: { lastHeartbeat: { lt: cutoff } },
+        where: {
+          id: { not: this.instanceId },
+          lastHeartbeat: { lt: cutoff },
+        },
       });
 
-      // Refresh cluster health assessment
-      await this.checkHealth();
-
       // Attempt to become leader if no active leader exists
-      await this.tryBecomeLeader();
+      await this.tryBecomeLeader(now);
+
+      // Refresh cluster health assessment after any lease change
+      await this.refreshHealth(now);
     } catch (error) {
       this.logger.error(
         'Heartbeat failed — marking cluster as PARTITIONED',
         error,
       );
-      this.currentHealth = ClusterHealth.PARTITIONED;
+      this.healthSnapshot = this.createPartitionedSnapshot();
+      this.currentHealth = this.healthSnapshot.health;
       this.isLeader = false;
     }
   }
@@ -149,31 +172,85 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
   // ── Health Checks ──────────────────────────────────────
 
   /** Assess cluster health by counting alive nodes */
-  async checkHealth(): Promise<ClusterHealth> {
-    try {
-      const cutoff = new Date(Date.now() - this.nodeTimeoutMs);
-      const aliveCount = await this.prisma.clusterNode.count({
-        where: { lastHeartbeat: { gte: cutoff } },
-      });
+  async checkHealth(forceRefresh = true): Promise<ClusterHealth> {
+    const snapshot = await this.getHealthSnapshot(forceRefresh);
+    return snapshot.health;
+  }
 
-      if (aliveCount >= this.minNodes) {
-        this.currentHealth = ClusterHealth.HEALTHY;
-      } else if (aliveCount > 0) {
-        this.currentHealth = ClusterHealth.DEGRADED;
-      } else {
-        this.currentHealth = ClusterHealth.PARTITIONED;
+  async getHealthSnapshot(
+    forceRefresh = false,
+  ): Promise<ClusterHealthSnapshot> {
+    if (!forceRefresh) {
+      return this.healthSnapshot;
+    }
+
+    return this.refreshHealth();
+  }
+
+  private async refreshHealth(now = new Date()): Promise<ClusterHealthSnapshot> {
+    try {
+      const cutoff = new Date(now.getTime() - this.nodeTimeoutMs);
+      await this.prisma.$queryRaw`SELECT 1`;
+
+      const [selfNode, aliveCount, lease] = await Promise.all([
+        this.prisma.clusterNode.findUnique({
+          where: { id: this.instanceId },
+          select: { id: true },
+        }),
+        this.prisma.clusterNode.count({
+          where: { lastHeartbeat: { gte: cutoff } },
+        }),
+        this.prisma.clusterLease.findUnique({
+          where: { name: ConsistencyService.SCHEDULER_LEASE },
+          select: { ownerId: true, leaseUntil: true },
+        }),
+      ]);
+
+      const schedulerLeaseActive =
+        !!lease && lease.leaseUntil.getTime() > now.getTime();
+      const schedulerReady =
+        schedulerLeaseActive && lease.ownerId === this.instanceId;
+      const selfRegistered = !!selfNode;
+      const requiredNodeCount = Math.max(this.minNodes, 1);
+      const nodeQuorumMet = aliveCount >= requiredNodeCount;
+      const writeSafe = selfRegistered;
+
+      let health = ClusterHealth.HEALTHY;
+      if (!writeSafe) {
+        health = ClusterHealth.DEGRADED;
+      } else if (!nodeQuorumMet || (aliveCount > 1 && !schedulerLeaseActive)) {
+        health = ClusterHealth.DEGRADED;
       }
 
-      return this.currentHealth;
+      this.isLeader = schedulerReady;
+      this.currentHealth = health;
+      this.healthSnapshot = {
+        health,
+        checkedAt: now,
+        databaseReachable: true,
+        writeSafe,
+        selfRegistered,
+        aliveNodeCount: aliveCount,
+        requiredNodeCount,
+        nodeQuorumMet,
+        schedulerLeaseOwnerId: lease?.ownerId ?? null,
+        schedulerLeaseExpiresAt: lease?.leaseUntil ?? null,
+        schedulerReady,
+        isLeader: schedulerReady,
+      };
+
+      return this.healthSnapshot;
     } catch {
-      this.currentHealth = ClusterHealth.PARTITIONED;
-      return ClusterHealth.PARTITIONED;
+      this.healthSnapshot = this.createPartitionedSnapshot(now);
+      this.currentHealth = this.healthSnapshot.health;
+      this.isLeader = false;
+      return this.healthSnapshot;
     }
   }
 
   /** Get current cluster health (cached from last heartbeat cycle) */
   getHealth(): ClusterHealth {
-    return this.currentHealth;
+    return this.healthSnapshot.health;
   }
 
   /**
@@ -183,14 +260,20 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
    * This is the CP gate — operations are REJECTED during
    * partitions rather than risk stale/inconsistent execution.
    */
-  requireHealthy(): void {
-    if (this.currentHealth !== ClusterHealth.HEALTHY) {
+  async requireHealthy(): Promise<void> {
+    const snapshot = await this.getHealthSnapshot(true);
+    if (!snapshot.writeSafe) {
       throw new PartitionException(
-        `Cluster health is ${this.currentHealth}. ` +
-          'Operation rejected to maintain CP consistency. ' +
-          'Will resume when quorum is restored.',
+        `Cluster health is ${snapshot.health}. ` +
+          'Database quorum or node registration is unavailable. ' +
+          'Operation rejected to maintain CP consistency.',
       );
     }
+  }
+
+  async hasLeadership(): Promise<boolean> {
+    const snapshot = await this.getHealthSnapshot(true);
+    return snapshot.schedulerReady;
   }
 
   // ── Leader Election ────────────────────────────────────
@@ -202,9 +285,8 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
    * scheduler. Without this, multiple instances would evaluate
    * the same schedules and create duplicate tasks — violating CP.
    */
-  private async tryBecomeLeader(): Promise<void> {
+  private async tryBecomeLeader(now = new Date()): Promise<void> {
     try {
-      const now = new Date();
       const leaseUntil = new Date(now.getTime() + this.leaderLeaseMs);
       const acquired = await this.prisma.$transaction(async (tx) => {
         await tx.clusterLease.createMany({
@@ -265,6 +347,12 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
       } else {
         this.logger.error('Leader lease renewal failed', error);
       }
+      await this.prisma.clusterNode
+        .updateMany({
+          where: { id: this.instanceId, isLeader: true },
+          data: { isLeader: false },
+        })
+        .catch(() => {});
       this.isLeader = false;
     }
   }
@@ -283,7 +371,7 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
         },
         data: { leaseUntil: now },
       }),
-      this.prisma.clusterNode.update({
+      this.prisma.clusterNode.updateMany({
         where: { id: this.instanceId },
         data: { isLeader: false },
       }),
@@ -294,6 +382,25 @@ export class ConsistencyService implements OnModuleInit, OnModuleDestroy {
 
   /** Check if this node is the current leader */
   getIsLeader(): boolean {
-    return this.isLeader;
+    return this.healthSnapshot.isLeader;
+  }
+
+  private createPartitionedSnapshot(
+    checkedAt = new Date(),
+  ): ClusterHealthSnapshot {
+    return {
+      health: ClusterHealth.PARTITIONED,
+      checkedAt,
+      databaseReachable: false,
+      writeSafe: false,
+      selfRegistered: false,
+      aliveNodeCount: 0,
+      requiredNodeCount: Math.max(this.minNodes, 1),
+      nodeQuorumMet: false,
+      schedulerLeaseOwnerId: null,
+      schedulerLeaseExpiresAt: null,
+      schedulerReady: false,
+      isLeader: false,
+    };
   }
 }

@@ -12,9 +12,12 @@
 import { registerAs } from '@nestjs/config';
 
 export const appConfig = registerAs('app', () => ({
+  nodeEnv: process.env.NODE_ENV ?? 'development',
+
   // Server
   port: parseInt(process.env.PORT ?? '3000', 10),
   apiKey: process.env.API_KEY ?? '',
+  allowUnauthenticated: process.env.ALLOW_UNAUTHENTICATED === 'true',
   instanceId: process.env.INSTANCE_ID ?? `node-${process.pid}`,
   encryptionKey: process.env.ENCRYPTION_KEY ?? '',
 

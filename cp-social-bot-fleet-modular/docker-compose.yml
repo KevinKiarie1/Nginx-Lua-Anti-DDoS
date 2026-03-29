@@ -1,8 +1,8 @@
 # ============================================================
-# Docker Compose — CP-SOCIAL-BOT-FLEET-MODULAR
+# Docker Compose (development) — CP-SOCIAL-BOT-FLEET-MODULAR
 # ============================================================
-# Runs:
-# 1. CockroachDB single-node (CP-consistent database)
+# Runs a local development stack only:
+# 1. CockroachDB single-node in insecure mode
 # 2. The NestJS modular monolith (API + task dispatcher)
 #
 # CockroachDB provides SERIALIZABLE isolation by default and

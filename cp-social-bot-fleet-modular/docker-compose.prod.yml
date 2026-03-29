@@ -1,0 +1,132 @@
+x-cockroach-base: &cockroach-base
+  image: cockroachdb/cockroach:v23.2.0
+  volumes:
+    - ./ops/cockroach/certs:/cockroach/certs:ro
+  restart: unless-stopped
+  networks:
+    - botnet
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - ${APP_ENV_FILE:-.env.production}
+  volumes:
+    - ./ops/cockroach/certs:/cockroach/certs:ro
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+  healthcheck:
+    test: ['CMD-SHELL', 'curl -fsS -H "X-Api-Key: $$API_KEY" http://localhost:3000/api/health >/dev/null || exit 1']
+    interval: 30s
+    timeout: 5s
+    retries: 5
+  networks:
+    - botnet
+
+services:
+  cockroach1:
+    <<: *cockroach-base
+    command: start --certs-dir=/cockroach/certs --advertise-addr=cockroach1 --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 --join=cockroach1,cockroach2,cockroach3 --store=path=/cockroach/cockroach-data
+    ports:
+      - '26257:26257'
+      - '8080:8080'
+    volumes:
+      - ./ops/cockroach/certs:/cockroach/certs:ro
+      - cockroach1-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ['CMD-SHELL', 'cockroach sql --certs-dir=/cockroach/certs --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1 || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cockroach2:
+    <<: *cockroach-base
+    command: start --certs-dir=/cockroach/certs --advertise-addr=cockroach2 --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 --join=cockroach1,cockroach2,cockroach3 --store=path=/cockroach/cockroach-data
+    volumes:
+      - ./ops/cockroach/certs:/cockroach/certs:ro
+      - cockroach2-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ['CMD-SHELL', 'cockroach sql --certs-dir=/cockroach/certs --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1 || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cockroach3:
+    <<: *cockroach-base
+    command: start --certs-dir=/cockroach/certs --advertise-addr=cockroach3 --listen-addr=0.0.0.0:26257 --http-addr=0.0.0.0:8080 --join=cockroach1,cockroach2,cockroach3 --store=path=/cockroach/cockroach-data
+    volumes:
+      - ./ops/cockroach/certs:/cockroach/certs:ro
+      - cockroach3-data:/cockroach/cockroach-data
+    healthcheck:
+      test: ['CMD-SHELL', 'cockroach sql --certs-dir=/cockroach/certs --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1 || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cockroach-init:
+    image: cockroachdb/cockroach:v23.2.0
+    env_file:
+      - ${APP_ENV_FILE:-.env.production}
+    depends_on:
+      cockroach1:
+        condition: service_healthy
+      cockroach2:
+        condition: service_healthy
+      cockroach3:
+        condition: service_healthy
+    volumes:
+      - ./ops/cockroach/certs:/cockroach/certs:ro
+      - ./ops/cockroach/init:/cockroach/init:ro
+    command: ['/bin/sh', '/cockroach/init/init-cluster.sh']
+    restart: 'no'
+    networks:
+      - botnet
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${APP_ENV_FILE:-.env.production}
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./ops/cockroach/certs:/cockroach/certs:ro
+    command: ['npm', 'run', 'prisma:migrate:deploy']
+    restart: 'no'
+    networks:
+      - botnet
+
+  app1:
+    <<: *app-base
+    environment:
+      INSTANCE_ID: app-1
+    ports:
+      - '3001:3000'
+
+  app2:
+    <<: *app-base
+    environment:
+      INSTANCE_ID: app-2
+    ports:
+      - '3002:3000'
+
+  app3:
+    <<: *app-base
+    environment:
+      INSTANCE_ID: app-3
+    ports:
+      - '3003:3000'
+
+volumes:
+  cockroach1-data:
+  cockroach2-data:
+  cockroach3-data:
+
+networks:
+  botnet:
+    driver: bridge

@@ -23,9 +23,19 @@ export class ApiKeyGuard implements CanActivate {
     const request = context.switchToHttp().getRequest<Request>();
     const apiKey = request.headers['x-api-key'] as string;
     const expectedKey = this.config.get<string>('app.apiKey');
+    const allowUnauthenticated = this.config.get<boolean>(
+      'app.allowUnauthenticated',
+    );
 
-    // No key configured = no auth required (dev mode)
-    if (!expectedKey) return true;
+    if (allowUnauthenticated) {
+      return true;
+    }
+
+    if (!expectedKey) {
+      throw new UnauthorizedException(
+        'API authentication is not configured for this deployment',
+      );
+    }
 
     if (!apiKey || apiKey !== expectedKey) {
       throw new UnauthorizedException('Invalid or missing API key');

@@ -22,7 +22,7 @@ export class ConsistencyGuard implements CanActivate {
     private readonly consistency: ConsistencyService,
   ) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const requireHealthy = this.reflector.getAllAndOverride<boolean>(
       REQUIRE_HEALTHY_KEY,
       [context.getHandler(), context.getClass()],
@@ -33,7 +33,7 @@ export class ConsistencyGuard implements CanActivate {
     }
 
     // This will throw PartitionException if unhealthy
-    this.consistency.requireHealthy();
+    await this.consistency.requireHealthy();
     return true;
   }
 }

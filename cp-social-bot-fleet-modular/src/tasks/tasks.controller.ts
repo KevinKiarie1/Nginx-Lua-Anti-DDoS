@@ -23,6 +23,7 @@ import { TaskQueueService } from '../core/queue/task-queue.service';
 import {
   ConsistencyService,
   ClusterHealth,
+  ClusterHealthSnapshot,
 } from '../core/consistency/consistency.service';
 import { CreateTaskDto } from '../common/dto/create-task.dto';
 import { RequireHealthy } from '../common/decorators/require-healthy.decorator';
@@ -64,13 +65,31 @@ export class TasksController {
    */
   @Get('health')
   async getHealth() {
-    const health = await this.consistency.checkHealth();
+    const snapshot = await this.consistency.getHealthSnapshot(true);
     return {
-      status: health === ClusterHealth.HEALTHY ? 'ok' : 'degraded',
-      health,
+      status: this.getStatus(snapshot),
+      health: snapshot.health,
       instanceId: process.env.INSTANCE_ID ?? 'default',
-      isLeader: this.consistency.getIsLeader(),
+      isLeader: snapshot.isLeader,
+      databaseReachable: snapshot.databaseReachable,
+      writeSafe: snapshot.writeSafe,
+      selfRegistered: snapshot.selfRegistered,
+      aliveNodeCount: snapshot.aliveNodeCount,
+      requiredNodeCount: snapshot.requiredNodeCount,
+      nodeQuorumMet: snapshot.nodeQuorumMet,
+      schedulerLeaseOwnerId: snapshot.schedulerLeaseOwnerId,
+      schedulerLeaseExpiresAt: snapshot.schedulerLeaseExpiresAt,
+      schedulerReady: snapshot.schedulerReady,
+      checkedAt: snapshot.checkedAt.toISOString(),
       timestamp: new Date().toISOString(),
     };
+  }
+
+  private getStatus(snapshot: ClusterHealthSnapshot): string {
+    if (snapshot.health === ClusterHealth.HEALTHY) {
+      return 'ok';
+    }
+
+    return snapshot.writeSafe ? 'degraded' : 'error';
   }
 }

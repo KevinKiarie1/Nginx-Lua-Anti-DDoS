@@ -149,7 +149,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 # Paste the result as ENCRYPTION_KEY in .env
 ```
 
-### 2. Start with Docker Compose
+### 2. Start with Docker Compose (development only)
 
 ```bash
 # Start CockroachDB + the NestJS app
@@ -181,6 +181,28 @@ npx prisma db push
 # Start in development mode
 npm run start:dev
 ```
+
+### 4. Production deployment
+
+The checked-in [docker-compose.yml](docker-compose.yml) is intentionally a single-node insecure development stack. For production, use [docker-compose.prod.yml](docker-compose.prod.yml) with secure multi-node CockroachDB, bootstrap SQL, and Prisma migrations.
+
+```bash
+cp .env.production.example .env.production
+
+# Generate Cockroach certificates into ops/cockroach/certs
+./scripts/generate-cockroach-certs.sh
+
+# Start 3 Cockroach nodes, initialize the cluster, run migrations,
+# and bring up 3 API instances on ports 3001-3003
+docker compose -f docker-compose.prod.yml up --build -d
+```
+
+The production stack uses these stages:
+
+1. Three CockroachDB nodes in secure mode with TLS.
+2. A one-shot bootstrap container that initializes the cluster and creates the application database and SQL user.
+3. A one-shot migration container that runs `prisma migrate deploy`.
+4. Three application instances with explicit `INSTANCE_ID` values.
 
 ---
 

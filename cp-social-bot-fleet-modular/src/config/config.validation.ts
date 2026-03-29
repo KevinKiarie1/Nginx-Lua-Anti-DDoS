@@ -9,7 +9,14 @@
 export function validateEnvironment(
   config: Record<string, unknown>,
 ): Record<string, unknown> {
+  const nodeEnv = String(config['NODE_ENV'] ?? 'development');
+  const allowUnauthenticated = config['ALLOW_UNAUTHENTICATED'] === 'true';
   const required = ['DATABASE_URL', 'ENCRYPTION_KEY'];
+
+  if (!allowUnauthenticated) {
+    required.push('API_KEY');
+  }
+
   const missing = required.filter((key) => !config[key]);
 
   if (missing.length > 0) {
@@ -19,6 +26,13 @@ export function validateEnvironment(
         `Copy .env.example to .env and fill in values.`,
     );
   }
+
+    if (allowUnauthenticated && nodeEnv === 'production') {
+      throw new Error(
+        'ALLOW_UNAUTHENTICATED cannot be true in production. ' +
+          'Configure API_KEY for all production deployments.',
+      );
+    }
 
   // Validate encryption key length (at least 32 chars)
   const encKey = config['ENCRYPTION_KEY'] as string;

@@ -68,12 +68,12 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
    */
   async evaluate(): Promise<void> {
     // CP Gate: Only the leader evaluates schedules
-    if (!this.consistency.getIsLeader()) {
+    if (!(await this.consistency.hasLeadership())) {
       return;
     }
 
     try {
-      this.consistency.requireHealthy();
+      await this.consistency.requireHealthy();
     } catch {
       this.logger.debug(
         'Skipping schedule evaluation — cluster not healthy',

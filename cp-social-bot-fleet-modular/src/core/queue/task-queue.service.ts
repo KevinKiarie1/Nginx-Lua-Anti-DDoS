@@ -22,11 +22,18 @@
 
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Platform, Prisma } from '@prisma/client';
+import { Platform, Prisma, TaskStatus } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { ConsistencyService } from '../consistency/consistency.service';
 import { CreateTaskDto } from '../../common/dto/create-task.dto';
 import { validateTaskRequest } from '../../common/task-capabilities';
+
+export class TaskLeaseOwnershipError extends Error {
+  constructor(taskId: string) {
+    super(`Lost lease ownership for task ${taskId}`);
+    this.name = 'TaskLeaseOwnershipError';
+  }
+}
 
 @Injectable()
 export class TaskQueueService {
@@ -55,7 +62,7 @@ export class TaskQueueService {
    */
   async createTask(dto: CreateTaskDto) {
     // CP Gate: require healthy cluster before writes
-    this.consistency.requireHealthy();
+    await this.consistency.requireHealthy();
 
     validateTaskRequest(dto);
 
@@ -108,7 +115,7 @@ export class TaskQueueService {
    * and retries on the next poll cycle.
    */
   async claimNextTask(platforms: Platform[]): Promise<string | null> {
-    this.consistency.requireHealthy();
+    await this.consistency.requireHealthy();
 
     try {
       return await this.prisma.$transaction(
@@ -170,8 +177,13 @@ export class TaskQueueService {
   /** Mark a claimed task as running */
   async markTaskRunning(taskId: string): Promise<void> {
     const now = new Date();
-    await this.prisma.task.update({
-      where: { id: taskId },
+    const updated = await this.prisma.task.updateMany({
+      where: {
+        id: taskId,
+        claimedBy: this.instanceId,
+        status: TaskStatus.CLAIMED,
+        leaseExpiresAt: { gt: now },
+      },
       data: {
         status: 'RUNNING',
         startedAt: now,
@@ -179,6 +191,10 @@ export class TaskQueueService {
         leaseExpiresAt: this.getLeaseExpiration(now),
       },
     });
+
+    if (updated.count !== 1) {
+      throw new TaskLeaseOwnershipError(taskId);
+    }
   }
 
   /** Renew the lease for a currently running task owned by this instance */
@@ -204,8 +220,13 @@ export class TaskQueueService {
     taskId: string,
     result?: Record<string, unknown>,
   ): Promise<void> {
-    await this.prisma.task.update({
-      where: { id: taskId },
+    const updated = await this.prisma.task.updateMany({
+      where: {
+        id: taskId,
+        claimedBy: this.instanceId,
+        status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
+        leaseExpiresAt: { gt: new Date() },
+      },
       data: {
         status: 'COMPLETED',
         result: (result as Prisma.InputJsonValue) ?? Prisma.JsonNull,
@@ -214,6 +235,11 @@ export class TaskQueueService {
         workerHeartbeatAt: null,
       },
     });
+
+    if (updated.count !== 1) {
+      throw new TaskLeaseOwnershipError(taskId);
+    }
+
     this.logger.log(`Task ${taskId} completed`);
   }
 
@@ -229,18 +255,31 @@ export class TaskQueueService {
     errorMessage: string,
     options?: { retryable?: boolean },
   ): Promise<void> {
-    const task = await this.prisma.task.findUnique({
-      where: { id: taskId },
+    const now = new Date();
+    const task = await this.prisma.task.findFirst({
+      where: {
+        id: taskId,
+        claimedBy: this.instanceId,
+        status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
+        leaseExpiresAt: { gt: now },
+      },
     });
-    if (!task) return;
+    if (!task) {
+      throw new TaskLeaseOwnershipError(taskId);
+    }
 
     const nextRetryCount = task.retryCount + 1;
     const retryable = options?.retryable ?? true;
     const isFinalFailure = !retryable || nextRetryCount >= task.maxRetries;
 
     if (isFinalFailure) {
-      await this.prisma.task.update({
-        where: { id: taskId },
+      const updated = await this.prisma.task.updateMany({
+        where: {
+          id: taskId,
+          claimedBy: this.instanceId,
+          status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
+          leaseExpiresAt: { gt: now },
+        },
         data: {
           status: 'DEAD_LETTER',
           errorMessage,
@@ -250,13 +289,21 @@ export class TaskQueueService {
           workerHeartbeatAt: null,
         },
       });
+      if (updated.count !== 1) {
+        throw new TaskLeaseOwnershipError(taskId);
+      }
       this.logger.warn(
         `Task ${taskId} moved to DEAD_LETTER after ${nextRetryCount} attempts`,
       );
     } else {
       // Reset to PENDING for retry
-      await this.prisma.task.update({
-        where: { id: taskId },
+      const updated = await this.prisma.task.updateMany({
+        where: {
+          id: taskId,
+          claimedBy: this.instanceId,
+          status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
+          leaseExpiresAt: { gt: now },
+        },
         data: {
           status: 'PENDING',
           errorMessage,
@@ -268,6 +315,9 @@ export class TaskQueueService {
           workerHeartbeatAt: null,
         },
       });
+      if (updated.count !== 1) {
+        throw new TaskLeaseOwnershipError(taskId);
+      }
       this.logger.warn(
         `Task ${taskId} failed (attempt ${nextRetryCount}/${task.maxRetries}), re-queued`,
       );
