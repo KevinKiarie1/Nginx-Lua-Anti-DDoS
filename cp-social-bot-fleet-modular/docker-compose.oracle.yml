@@ -1,0 +1,117 @@
+# ============================================================
+# Docker Compose — Oracle Cloud A1 Free Tier
+# ============================================================
+# Single-node topology optimized for 1× Ampere A1 VM
+# (4 OCPU / 24 GB RAM on Always Free).
+#
+# Components:
+#   cockroach  — single-node CockroachDB (insecure, no certs)
+#   migrate    — runs Prisma migrations then exits
+#   app        — the NestJS modular monolith
+#   nginx      — reverse proxy with basic rate limiting
+#
+# Usage:
+#   docker compose -f docker-compose.oracle.yml up -d
+#   docker compose -f docker-compose.oracle.yml logs -f app
+# ============================================================
+
+services:
+  cockroach:
+    image: cockroachdb/cockroach:v23.2.0
+    command: start-single-node --insecure --store=path=/cockroach/cockroach-data --cache=256MiB --max-sql-memory=256MiB
+    ports:
+      - '127.0.0.1:26257:26257'
+      - '127.0.0.1:8080:8080'
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'cockroach sql --insecure --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1 || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    networks:
+      - botnet
+
+  cockroach-init:
+    image: cockroachdb/cockroach:v23.2.0
+    depends_on:
+      cockroach:
+        condition: service_healthy
+    command: >
+      sql --insecure --host=cockroach:26257 -e
+      "CREATE DATABASE IF NOT EXISTS social_bot;
+       CREATE USER IF NOT EXISTS bot_user;
+       GRANT ALL ON DATABASE social_bot TO bot_user;"
+    restart: 'no'
+    networks:
+      - botnet
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.oracle-free
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    restart: 'no'
+    networks:
+      - botnet
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.oracle-free
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - app-sessions:/app/data/sessions
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:3000/api/health >/dev/null || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    networks:
+      - botnet
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - '80:80'
+    volumes:
+      - ./ops/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.25'
+    networks:
+      - botnet
+
+volumes:
+  cockroach-data:
+  app-sessions:
+
+networks:
+  botnet:
+    driver: bridge

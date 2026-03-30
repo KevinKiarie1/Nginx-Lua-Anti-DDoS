@@ -35,11 +35,14 @@ import { HealthEventType } from '../core/account-health/account-health.service';
 @Injectable()
 export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TaskDispatcherService.name);
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollTimeout: ReturnType<typeof setTimeout> | null = null;
   private activeTasks = 0;
   private isShuttingDown = false;
+  private currentPollMs: number;
 
   private readonly pollIntervalMs: number;
+  private readonly maxPollIntervalMs: number;
+  private readonly pollBackoffMultiplier: number;
   private readonly maxConcurrentTasks: number;
   private readonly leaseRenewIntervalMs: number;
   private readonly taskTimeoutMs: number;
@@ -56,6 +59,12 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
     this.pollIntervalMs = this.config.get<number>(
       'app.workerPollIntervalMs',
     )!;
+    this.maxPollIntervalMs = this.config.get<number>(
+      'app.workerMaxPollIntervalMs',
+    )!;
+    this.pollBackoffMultiplier = this.config.get<number>(
+      'app.workerPollBackoffMultiplier',
+    )!;
     this.maxConcurrentTasks = this.config.get<number>(
       'app.workerMaxConcurrentTasks',
     )!;
@@ -65,6 +74,7 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
     this.taskTimeoutMs = this.config.get<number>(
       'app.workerTaskTimeoutMs',
     )!;
+    this.currentPollMs = this.pollIntervalMs;
 
     const platformStr = this.config.get<string>('app.workerPlatforms')!;
     this.platforms = platformStr
@@ -91,16 +101,11 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
         await this.registry.initializeAll();
         this.logger.log(
           `Task dispatcher started — polling every ${this.pollIntervalMs}ms ` +
+            `(backoff up to ${this.maxPollIntervalMs}ms) ` +
             `for platforms: ${this.platforms.join(', ')}`,
         );
 
-        this.pollTimer = setInterval(() => {
-          if (!this.isShuttingDown) {
-            this.poll().catch((err) =>
-              this.logger.error('Poll cycle error', err),
-            );
-          }
-        }, this.pollIntervalMs);
+        this.schedulePoll();
         return;
       } catch (err) {
         this.logger.warn(
@@ -119,34 +124,68 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Schedule the next poll using adaptive backoff.
+   * When the queue is empty, the delay grows by pollBackoffMultiplier
+   * up to maxPollIntervalMs. When a task is found, it snaps back
+   * to the base pollIntervalMs — saving CPU/DB on idle A1 VMs.
+   */
+  private schedulePoll(): void {
+    if (this.isShuttingDown) return;
+    this.pollTimeout = setTimeout(() => {
+      this.poll()
+        .then((foundTask) => {
+          if (foundTask) {
+            // Snap back to base interval when work is available
+            this.currentPollMs = this.pollIntervalMs;
+          } else {
+            // Exponential backoff when idle
+            this.currentPollMs = Math.min(
+              this.currentPollMs * this.pollBackoffMultiplier,
+              this.maxPollIntervalMs,
+            );
+          }
+          this.schedulePoll();
+        })
+        .catch((err) => {
+          this.logger.error('Poll cycle error', err);
+          this.schedulePoll();
+        });
+    }, this.currentPollMs);
+  }
+
   private stopPolling(): void {
     this.isShuttingDown = true;
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    if (this.pollTimeout) {
+      clearTimeout(this.pollTimeout);
+      this.pollTimeout = null;
     }
   }
 
-  private async poll(): Promise<void> {
+  /**
+   * Single poll cycle. Returns true if a task was claimed.
+   */
+  private async poll(): Promise<boolean> {
     // CP Gate: Skip if cluster is not healthy
     try {
       await this.consistency.requireHealthy();
     } catch {
       this.logger.debug('Skipping poll — cluster not healthy');
-      return;
+      return false;
     }
 
     // Concurrency limit
-    if (this.activeTasks >= this.maxConcurrentTasks) return;
+    if (this.activeTasks >= this.maxConcurrentTasks) return false;
 
     // Claim next task from the queue
     const taskId = await this.queue.claimNextTask(this.platforms);
-    if (!taskId) return;
+    if (!taskId) return false;
 
     // Execute in background (non-blocking to the poll loop)
     this.executeTask(taskId).catch((err) =>
       this.logger.error(`Unhandled task error: ${taskId}`, err),
     );
+    return true;
   }
 
   private async executeTask(taskId: string): Promise<void> {

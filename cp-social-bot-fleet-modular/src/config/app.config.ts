@@ -47,6 +47,13 @@ export const appConfig = registerAs('app', () => ({
     process.env.WORKER_TASK_TIMEOUT_MS ?? '300000',
     10,
   ),
+  workerMaxPollIntervalMs: parseInt(
+    process.env.WORKER_MAX_POLL_INTERVAL_MS ?? '30000',
+    10,
+  ),
+  workerPollBackoffMultiplier: parseFloat(
+    process.env.WORKER_POLL_BACKOFF_MULTIPLIER ?? '1.5',
+  ),
 
   // Cluster / CP consistency
   clusterHeartbeatIntervalMs: parseInt(
@@ -87,4 +94,7 @@ export const appConfig = registerAs('app', () => ({
   // Browser automation
   browserHeadless: process.env.BROWSER_HEADLESS !== 'false',
   browserSlowMo: parseInt(process.env.BROWSER_SLOW_MO ?? '50', 10),
+
+  // Session persistence (browser contexts saved to disk for reuse)
+  sessionStorageDir: process.env.SESSION_STORAGE_DIR ?? './data/sessions',
 }));

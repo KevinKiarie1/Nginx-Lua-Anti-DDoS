@@ -24,7 +24,7 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule.register());
 
   // Enable graceful shutdown hooks so OnApplicationShutdown fires
   app.enableShutdownHooks();

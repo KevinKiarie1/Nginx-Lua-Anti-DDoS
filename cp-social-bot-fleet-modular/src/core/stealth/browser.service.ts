@@ -19,6 +19,8 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { ProxyService } from '../proxy/proxy.service';
+import * as fs from 'fs';
+import * as path from 'path';
 import UserAgent = require('user-agents');
 
 @Injectable()
@@ -26,11 +28,18 @@ export class BrowserService implements OnModuleDestroy {
   private readonly logger = new Logger(BrowserService.name);
   private browser: Browser | null = null;
   private readonly contexts = new Map<string, BrowserContext>();
+  private readonly sessionDir: string;
 
   constructor(
     private readonly config: ConfigService,
     private readonly proxy: ProxyService,
-  ) {}
+  ) {
+    this.sessionDir = this.config.get<string>('app.sessionStorageDir')!;
+    // Ensure session directory exists
+    if (!fs.existsSync(this.sessionDir)) {
+      fs.mkdirSync(this.sessionDir, { recursive: true });
+    }
+  }
 
   async onModuleDestroy() {
     await this.closeAll();
@@ -72,6 +81,16 @@ export class BrowserService implements OnModuleDestroy {
     const ua = new UserAgent({ deviceCategory: 'desktop' });
     const proxyConfig = this.proxy.getProxyForAccount(accountId);
 
+    // Restore previous session state if it exists on disk
+    const sessionPath = path.join(this.sessionDir, `${accountId}.json`);
+    let storageState: string | undefined;
+    if (fs.existsSync(sessionPath)) {
+      storageState = sessionPath;
+      this.logger.debug(
+        `Restoring session state for account ${accountId}`,
+      );
+    }
+
     const context = await browser.newContext({
       userAgent: ua.toString(),
       viewport: {
@@ -80,6 +99,7 @@ export class BrowserService implements OnModuleDestroy {
       },
       locale: 'en-US',
       timezoneId: 'America/New_York',
+      ...(storageState ? { storageState } : {}),
       ...(proxyConfig
         ? {
             proxy: {
@@ -148,27 +168,46 @@ export class BrowserService implements OnModuleDestroy {
     return context.newPage();
   }
 
-  /** Close a specific account's context */
+  /** Close a specific account's context, persisting session state */
   async closeContext(accountId: string): Promise<void> {
     const context = this.contexts.get(accountId);
     if (context) {
+      await this.saveSession(accountId, context);
       await context.close();
       this.contexts.delete(accountId);
     }
   }
 
-  /** Close all contexts and the browser */
+  /** Close all contexts and the browser, persisting all sessions */
   async closeAll(): Promise<void> {
-    for (const [id] of this.contexts) {
-      const ctx = this.contexts.get(id);
-      if (ctx) await ctx.close().catch(() => {});
+    for (const [id, ctx] of this.contexts) {
+      await this.saveSession(id, ctx).catch(() => {});
+      await ctx.close().catch(() => {});
       this.contexts.delete(id);
     }
     if (this.browser) {
       await this.browser.close().catch(() => {});
       this.browser = null;
     }
-    this.logger.log('Browser and all contexts closed');
+    this.logger.log('Browser and all contexts closed (sessions saved)');
+  }
+
+  /** Save a context's cookies/localStorage to disk */
+  private async saveSession(
+    accountId: string,
+    context: BrowserContext,
+  ): Promise<void> {
+    try {
+      const sessionPath = path.join(this.sessionDir, `${accountId}.json`);
+      const state = await context.storageState();
+      fs.writeFileSync(sessionPath, JSON.stringify(state));
+      this.logger.debug(`Session state saved for account ${accountId}`);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to save session for account ${accountId}`,
+        err,
+      );
+    }
   }
 
   private randomInt(min: number, max: number): number {
