@@ -73,7 +73,9 @@ model Account {
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
-  tasks Task[]
+  tasks     Task[]
+  schedules Schedule[]
+  healthEvents AccountHealthEvent[]
 
   @@unique([platform, username])
   @@index([platform, isActive])
@@ -103,6 +105,8 @@ model Task {
   /// Number of retry attempts so far
   retryCount     Int        @default(0)
   maxRetries     Int        @default(3)
+  /// Earliest time this task can be re-claimed after a retry (exponential backoff)
+  nextRetryAt    DateTime?
   /// Which worker instance claimed this task
   claimedBy      String?
   claimedAt      DateTime?
@@ -139,6 +143,7 @@ model Schedule {
   /// JSON payload template for generated tasks
   payload   Json
   accountId String?  @db.Uuid
+  account   Account? @relation(fields: [accountId], references: [id])
   isActive  Boolean  @default(true)
   lastRunAt DateTime?
   nextRunAt DateTime?
@@ -146,6 +151,22 @@ model Schedule {
   updatedAt DateTime @updatedAt
 
   @@index([isActive, nextRunAt])
+}
+
+/// Tracks account health signals (bans, captchas, rate limits).
+/// Used by the execution plane to decide cooldown, rotation,
+/// or permanent deactivation of compromised accounts.
+model AccountHealthEvent {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId String   @db.Uuid
+  account   Account  @relation(fields: [accountId], references: [id])
+  eventType String   // BAN, CAPTCHA, RATE_LIMIT, SUSPENSION, RECOVERY
+  severity  Int      @default(1) // 1 = low, 5 = critical
+  detail    String?
+  createdAt DateTime @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([eventType, createdAt])
 }
 
 /// Audit trail of every post/action executed.

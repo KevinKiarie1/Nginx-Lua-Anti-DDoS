@@ -14,58 +14,48 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseIntPipe,
+  DefaultValuePipe,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
-import { PrismaService } from '../core/database/prisma.service';
 import {
   CreateScheduleDto,
   UpdateScheduleDto,
 } from '../common/dto/create-schedule.dto';
-import { validateTaskRequest } from '../common/task-capabilities';
 import { RequireHealthy } from '../common/decorators/require-healthy.decorator';
 import { ConsistencyGuard } from '../core/consistency/consistency.guard';
 import { ApiKeyGuard } from '../common/guards/api-key.guard';
+import { SchedulesService } from './schedules.service';
 
 @Controller('api/schedules')
 @UseGuards(ApiKeyGuard, ConsistencyGuard)
 export class SchedulesController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly schedulesService: SchedulesService) {}
 
   @Post()
   @RequireHealthy()
   @HttpCode(HttpStatus.CREATED)
   async createSchedule(@Body() dto: CreateScheduleDto) {
-    validateTaskRequest({
-      platform: dto.platform,
-      type: dto.taskType,
-      accountId: dto.accountId,
-    });
-
-    return this.prisma.schedule.create({
-      data: {
-        name: dto.name,
-        cronExpr: dto.cronExpr,
-        platform: dto.platform,
-        taskType: dto.taskType,
-        payload: dto.payload as Prisma.InputJsonValue,
-        accountId: dto.accountId,
-      },
-    });
+    return this.schedulesService.create(dto);
   }
 
   @Get()
-  async getSchedules() {
-    return this.prisma.schedule.findMany({
-      orderBy: { createdAt: 'desc' },
-    });
+  async getSchedules(
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
+  ) {
+    return this.schedulesService.findAll(
+      Math.max(1, page),
+      Math.min(Math.max(1, limit), 200),
+    );
   }
 
   @Get(':id')
   async getSchedule(@Param('id') id: string) {
-    return this.prisma.schedule.findUnique({ where: { id } });
+    return this.schedulesService.findOne(id);
   }
 
   @Put(':id')
@@ -74,21 +64,12 @@ export class SchedulesController {
     @Param('id') id: string,
     @Body() dto: UpdateScheduleDto,
   ) {
-    return this.prisma.schedule.update({
-      where: { id },
-      data: {
-        ...(dto.cronExpr !== undefined ? { cronExpr: dto.cronExpr } : {}),
-        ...(dto.payload !== undefined
-          ? { payload: dto.payload as Prisma.InputJsonValue }
-          : {}),
-        ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
-      },
-    });
+    return this.schedulesService.update(id, dto);
   }
 
   @Delete(':id')
   @RequireHealthy()
   async deleteSchedule(@Param('id') id: string) {
-    return this.prisma.schedule.delete({ where: { id } });
+    return this.schedulesService.remove(id);
   }
 }

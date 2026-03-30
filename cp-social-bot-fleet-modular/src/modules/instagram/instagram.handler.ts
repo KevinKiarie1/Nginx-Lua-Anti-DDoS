@@ -97,7 +97,7 @@ export class InstagramHandler implements PlatformHandler, OnModuleInit {
       const isLoggedIn = await page.$(
         'svg[aria-label="Home"]',
       );
-      if (isLoggedIn) return;
+      if (isLoggedIn) return; // session cookies already in context
 
       // Get credentials
       const account = await this.prisma.account.findUnique({

@@ -29,6 +29,8 @@ import {
 import { ConsistencyService } from '../core/consistency/consistency.service';
 import { HandlerRegistryService } from '../core/registry/handler-registry.service';
 import { RateLimiterService } from '../core/rate-limiter/rate-limiter.service';
+import { AccountHealthService } from '../core/account-health/account-health.service';
+import { HealthEventType } from '../core/account-health/account-health.service';
 
 @Injectable()
 export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
@@ -48,6 +50,7 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
     private readonly consistency: ConsistencyService,
     private readonly registry: HandlerRegistryService,
     private readonly rateLimiter: RateLimiterService,
+    private readonly accountHealth: AccountHealthService,
     private readonly config: ConfigService,
   ) {
     this.pollIntervalMs = this.config.get<number>(
@@ -71,18 +74,21 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    // Wait for platform handlers to register (they register in their onModuleInit)
-    setTimeout(() => this.startPolling(), 5000);
+    // Allow platform handlers to register (they register in their onModuleInit)
+    // then initialize all of them before starting the poll loop.
+    await this.initializeAndStart();
   }
 
   onModuleDestroy() {
     this.stopPolling();
   }
 
-  private startPolling(): void {
-    this.registry
-      .initializeAll()
-      .then(() => {
+  private async initializeAndStart(): Promise<void> {
+    // Retry initialization a few times in case DB or handlers aren't ready
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.registry.initializeAll();
         this.logger.log(
           `Task dispatcher started — polling every ${this.pollIntervalMs}ms ` +
             `for platforms: ${this.platforms.join(', ')}`,
@@ -95,10 +101,22 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
             );
           }
         }, this.pollIntervalMs);
-      })
-      .catch((err) => {
-        this.logger.error('Failed to initialize platform handlers', err);
-      });
+        return;
+      } catch (err) {
+        this.logger.warn(
+          `Handler initialization attempt ${attempt}/${maxAttempts} failed`,
+          err,
+        );
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 3000 * attempt));
+        } else {
+          this.logger.error(
+            'Failed to initialize platform handlers after max attempts',
+            err,
+          );
+        }
+      }
+    }
   }
 
   private stopPolling(): void {
@@ -168,6 +186,21 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      // Account health check — skip tasks for accounts in cooldown
+      if (task.accountId) {
+        const inCooldown = await this.accountHealth.isInCooldown(
+          task.accountId,
+        );
+        if (inCooldown) {
+          if (leaseOwnershipLost) return;
+          await this.queue.markTaskFailed(
+            taskId,
+            'Account in cooldown — will retry later',
+          );
+          return;
+        }
+      }
+
       // Rate limit check — if rate-limited, re-queue (not a failure)
       const allowed = await this.rateLimiter.acquireSlot(
         task.platform,
@@ -224,6 +257,25 @@ export class TaskDispatcherService implements OnModuleInit, OnModuleDestroy {
       if (result.success) {
         await this.queue.markTaskCompleted(taskId, result.data);
       } else {
+        // Detect ban/captcha signals from handler error messages
+        if (task.accountId && result.error) {
+          const lower = result.error.toLowerCase();
+          if (lower.includes('ban') || lower.includes('suspended')) {
+            await this.accountHealth.recordEvent(
+              task.accountId,
+              HealthEventType.BAN,
+              4,
+              result.error,
+            );
+          } else if (lower.includes('captcha') || lower.includes('challenge')) {
+            await this.accountHealth.recordEvent(
+              task.accountId,
+              HealthEventType.CAPTCHA,
+              3,
+              result.error,
+            );
+          }
+        }
         await this.queue.markTaskFailed(
           taskId,
           result.error ?? 'Unknown error',

@@ -26,12 +26,14 @@ import { PrismaModule } from './database/prisma.module';
 import { ConsistencyModule } from './consistency/consistency.module';
 import { QueueModule } from './queue/queue.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
+import { AccountHealthModule } from './account-health/account-health.module';
 import { CryptoService } from './crypto/crypto.service';
 import { ProxyService } from './proxy/proxy.service';
 import { BrowserService } from './stealth/browser.service';
 import { HumanService } from './stealth/human.service';
 import { RateLimiterService } from './rate-limiter/rate-limiter.service';
 import { HandlerRegistryService } from './registry/handler-registry.service';
+import { ShutdownService } from './lifecycle/shutdown.service';
 
 @Global()
 @Module({
@@ -40,6 +42,7 @@ import { HandlerRegistryService } from './registry/handler-registry.service';
     ConsistencyModule,
     QueueModule,
     SchedulerModule,
+    AccountHealthModule,
   ],
   providers: [
     CryptoService,
@@ -48,12 +51,14 @@ import { HandlerRegistryService } from './registry/handler-registry.service';
     HumanService,
     RateLimiterService,
     HandlerRegistryService,
+    ShutdownService,
   ],
   exports: [
     PrismaModule,
     ConsistencyModule,
     QueueModule,
     SchedulerModule,
+    AccountHealthModule,
     CryptoService,
     ProxyService,
     BrowserService,

@@ -20,6 +20,7 @@ export const appConfig = registerAs('app', () => ({
   allowUnauthenticated: process.env.ALLOW_UNAUTHENTICATED === 'true',
   instanceId: process.env.INSTANCE_ID ?? `node-${process.pid}`,
   encryptionKey: process.env.ENCRYPTION_KEY ?? '',
+  corsOrigins: process.env.CORS_ORIGINS ?? '',
 
   // Worker
   workerPlatforms:

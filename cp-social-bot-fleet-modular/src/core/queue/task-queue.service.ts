@@ -118,15 +118,19 @@ export class TaskQueueService {
     await this.consistency.requireHealthy();
 
     try {
+      const now = new Date();
       return await this.prisma.$transaction(
         async (tx) => {
-          const now = new Date();
-
           // Find the highest-priority pending task for our platforms
+          // that is either not waiting for a retry or whose retry delay has elapsed
           const task = await tx.task.findFirst({
             where: {
               status: 'PENDING',
               platform: { in: platforms },
+              OR: [
+                { nextRetryAt: null },
+                { nextRetryAt: { lte: now } },
+              ],
             },
             orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
           });
@@ -220,25 +224,51 @@ export class TaskQueueService {
     taskId: string,
     result?: Record<string, unknown>,
   ): Promise<void> {
-    const updated = await this.prisma.task.updateMany({
+    const now = new Date();
+    const task = await this.prisma.task.findFirst({
       where: {
         id: taskId,
         claimedBy: this.instanceId,
         status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
-        leaseExpiresAt: { gt: new Date() },
-      },
-      data: {
-        status: 'COMPLETED',
-        result: (result as Prisma.InputJsonValue) ?? Prisma.JsonNull,
-        completedAt: new Date(),
-        leaseExpiresAt: null,
-        workerHeartbeatAt: null,
+        leaseExpiresAt: { gt: now },
       },
     });
 
-    if (updated.count !== 1) {
+    if (!task) {
       throw new TaskLeaseOwnershipError(taskId);
     }
+
+    await this.prisma.$transaction([
+      this.prisma.task.updateMany({
+        where: {
+          id: taskId,
+          claimedBy: this.instanceId,
+          status: { in: [TaskStatus.CLAIMED, TaskStatus.RUNNING] },
+          leaseExpiresAt: { gt: now },
+        },
+        data: {
+          status: 'COMPLETED',
+          result: (result as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+          completedAt: now,
+          leaseExpiresAt: null,
+          workerHeartbeatAt: null,
+        },
+      }),
+      // Write audit trail
+      ...(task.accountId
+        ? [
+            this.prisma.postHistory.create({
+              data: {
+                platform: task.platform,
+                taskType: task.type,
+                accountId: task.accountId,
+                taskId: task.id,
+                resultData: (result as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+              },
+            }),
+          ]
+        : []),
+    ]);
 
     this.logger.log(`Task ${taskId} completed`);
   }
@@ -287,6 +317,7 @@ export class TaskQueueService {
           completedAt: new Date(),
           leaseExpiresAt: null,
           workerHeartbeatAt: null,
+          nextRetryAt: null,
         },
       });
       if (updated.count !== 1) {
@@ -296,6 +327,10 @@ export class TaskQueueService {
         `Task ${taskId} moved to DEAD_LETTER after ${nextRetryCount} attempts`,
       );
     } else {
+      // Exponential backoff: 5s, 20s, 80s, 320s …
+      const backoffMs = 5000 * Math.pow(4, nextRetryCount - 1);
+      const nextRetryAt = new Date(now.getTime() + backoffMs);
+
       // Reset to PENDING for retry
       const updated = await this.prisma.task.updateMany({
         where: {
@@ -313,6 +348,7 @@ export class TaskQueueService {
           startedAt: null,
           leaseExpiresAt: null,
           workerHeartbeatAt: null,
+          nextRetryAt,
         },
       });
       if (updated.count !== 1) {

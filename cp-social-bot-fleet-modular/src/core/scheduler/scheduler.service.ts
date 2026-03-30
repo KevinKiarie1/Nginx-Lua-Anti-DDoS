@@ -18,9 +18,12 @@ import {
   OnModuleDestroy,
   Logger,
 } from '@nestjs/common';
+import { CronExpressionParser } from 'cron-parser';
 import { PrismaService } from '../database/prisma.service';
 import { TaskQueueService } from '../queue/task-queue.service';
 import { ConsistencyService } from '../consistency/consistency.service';
+import { RateLimiterService } from '../rate-limiter/rate-limiter.service';
+import { AccountHealthService } from '../account-health/account-health.service';
 
 @Injectable()
 export class SchedulerService implements OnModuleInit, OnModuleDestroy {
@@ -32,6 +35,8 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly queue: TaskQueueService,
     private readonly consistency: ConsistencyService,
+    private readonly rateLimiter: RateLimiterService,
+    private readonly accountHealth: AccountHealthService,
   ) {}
 
   onModuleInit() {
@@ -120,50 +125,27 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // Also release stale tasks periodically (leader responsibility)
+    // Leader-only periodic maintenance
     await this.queue.releaseExpiredTaskLeases();
+    await this.rateLimiter.cleanup();
+    await this.accountHealth.cleanup();
   }
 
   /**
-   * Simple cron-expression parser for common patterns.
-   * Format: minute hour day-of-month month day-of-week
-   *
-   * Supports:
-   *   "* /N" intervals (e.g., "0 * /6 * * *" = every 6 hours)
-   *   Fixed time (e.g., "30 14 * * *" = 2:30 PM daily)
-   *
-   * For production, consider using a library like 'cron-parser'.
+   * Parse a cron expression using cron-parser and return the next
+   * occurrence after the given date.
    */
   calculateNextRun(cronExpr: string, fromDate: Date): Date {
-    const parts = cronExpr.trim().split(/\s+/);
-    if (parts.length < 5) {
-      // Fallback: run again in 1 hour
+    try {
+      const interval = CronExpressionParser.parse(cronExpr, {
+        currentDate: fromDate,
+      });
+      return interval.next().toDate();
+    } catch (error) {
+      this.logger.warn(
+        `Invalid cron expression "${cronExpr}", falling back to 1h: ${error}`,
+      );
       return new Date(fromDate.getTime() + 3600_000);
     }
-
-    const [minutePart, hourPart] = parts;
-    const next = new Date(fromDate);
-
-    if (hourPart.startsWith('*/')) {
-      const interval = parseInt(hourPart.slice(2), 10);
-      next.setHours(next.getHours() + interval);
-      next.setMinutes(parseInt(minutePart, 10) || 0);
-      next.setSeconds(0);
-      next.setMilliseconds(0);
-    } else if (minutePart.startsWith('*/')) {
-      const interval = parseInt(minutePart.slice(2), 10);
-      next.setMinutes(next.getMinutes() + interval);
-      next.setSeconds(0);
-      next.setMilliseconds(0);
-    } else {
-      // Fixed time — schedule for next occurrence
-      next.setDate(next.getDate() + 1);
-      next.setHours(parseInt(hourPart, 10) || 0);
-      next.setMinutes(parseInt(minutePart, 10) || 0);
-      next.setSeconds(0);
-      next.setMilliseconds(0);
-    }
-
-    return next;
   }
 }

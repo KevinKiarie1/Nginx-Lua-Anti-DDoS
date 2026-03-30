@@ -35,13 +35,25 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         `Unhandled error: ${exception.message}`,
         exception.stack,
       );
-      message = { statusCode: status, message: exception.message };
+      // Never leak stack traces to clients in production
+      message = {
+        statusCode: status,
+        message:
+          process.env.NODE_ENV === 'production'
+            ? 'Internal server error'
+            : exception.message,
+      };
     }
+
+    const correlationId = request.headers['x-correlation-id'] as
+      | string
+      | undefined;
 
     response.status(status).json({
       ...(typeof message === 'string' ? { message } : message),
       timestamp: new Date().toISOString(),
       path: request.url,
+      ...(correlationId ? { correlationId } : {}),
     });
   }
 }

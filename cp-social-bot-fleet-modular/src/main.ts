@@ -26,9 +26,23 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
 
+  // Enable graceful shutdown hooks so OnApplicationShutdown fires
+  app.enableShutdownHooks();
+
   // Security hardening
   app.use(helmet());
-  app.enableCors();
+
+  // CORS — restrict to configured origins in production
+  const allowedOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim())
+    : undefined;
+  app.enableCors({
+    origin: allowedOrigins ?? (process.env.NODE_ENV !== 'production'),
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'X-Api-Key', 'X-Correlation-Id'],
+    exposedHeaders: ['X-Correlation-Id'],
+    credentials: true,
+  });
 
   // Global validation pipe — validates all incoming DTOs
   // with whitelist stripping + transform enabled

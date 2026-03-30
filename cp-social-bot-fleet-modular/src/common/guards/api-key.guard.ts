@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
+import { timingSafeEqual } from 'crypto';
 
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
@@ -37,10 +38,16 @@ export class ApiKeyGuard implements CanActivate {
       );
     }
 
-    if (!apiKey || apiKey !== expectedKey) {
+    if (!apiKey || !this.safeCompare(apiKey, expectedKey)) {
       throw new UnauthorizedException('Invalid or missing API key');
     }
 
     return true;
+  }
+
+  /** Constant-time comparison to prevent timing-based key extraction. */
+  private safeCompare(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
   }
 }
