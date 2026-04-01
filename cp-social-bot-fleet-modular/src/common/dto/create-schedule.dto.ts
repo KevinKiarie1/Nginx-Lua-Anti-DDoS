@@ -5,6 +5,7 @@ import {
   IsObject,
   IsUUID,
   IsBoolean,
+  Matches,
 } from 'class-validator';
 import { Platform, TaskType } from '@prisma/client';
 
@@ -14,6 +15,10 @@ export class CreateScheduleDto {
 
   /** Cron expression, e.g. "0 *\/6 * * *" (every 6 hours) */
   @IsString()
+  @Matches(
+    /^(\*|[0-9,\-\/]+)\s+(\*|[0-9,\-\/]+)\s+(\*|[0-9,\-\/]+)\s+(\*|[0-9,\-\/]+)\s+(\*|[0-9,\-\/]+)$/,
+    { message: 'cronExpr must be a valid 5-field cron expression' },
+  )
   cronExpr!: string;
 
   @IsEnum(Platform)

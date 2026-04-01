@@ -47,7 +47,18 @@ export class ApiKeyGuard implements CanActivate {
 
   /** Constant-time comparison to prevent timing-based key extraction. */
   private safeCompare(a: string, b: string): boolean {
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    // Pad to equal length to avoid leaking key length via timing
+    if (bufA.length !== bufB.length) {
+      const maxLen = Math.max(bufA.length, bufB.length);
+      const paddedA = Buffer.alloc(maxLen);
+      const paddedB = Buffer.alloc(maxLen);
+      bufA.copy(paddedA);
+      bufB.copy(paddedB);
+      timingSafeEqual(paddedA, paddedB);
+      return false;
+    }
+    return timingSafeEqual(bufA, bufB);
   }
 }

@@ -18,6 +18,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { TaskQueueService } from '../core/queue/task-queue.service';
 import {
@@ -48,7 +49,7 @@ export class TasksController {
 
   /** Get a specific task by ID */
   @Get('tasks/:id')
-  async getTask(@Param('id') id: string) {
+  async getTask(@Param('id', ParseUUIDPipe) id: string) {
     return this.queue.getTask(id);
   }
 

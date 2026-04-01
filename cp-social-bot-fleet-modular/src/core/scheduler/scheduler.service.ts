@@ -127,6 +127,7 @@ export class SchedulerService implements OnModuleInit, OnModuleDestroy {
 
     // Leader-only periodic maintenance
     await this.queue.releaseExpiredTaskLeases();
+    await this.queue.cleanupCompletedTasks();
     await this.rateLimiter.cleanup();
     await this.accountHealth.cleanup();
   }

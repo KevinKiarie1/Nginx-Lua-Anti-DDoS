@@ -6,4 +6,9 @@ dist/
 cockroach-data/
 ops/cockroach/certs/*.crt
 ops/cockroach/certs/*.key
-
+.env.small-api
+.env.example
+.env.oracle-free
+.env.production.example
+.env.small-api.local    
+.env.small-browser

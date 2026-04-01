@@ -23,6 +23,8 @@ RUN npm run build
 # ── Stage 2: Runtime ─────────────────────────────────────────
 FROM node:20-slim
 
+ENV NODE_ENV=production
+
 # Install dumb-init for proper PID 1 signal handling
 RUN apt-get update && apt-get install -y --no-install-recommends \
     dumb-init \
@@ -60,7 +62,8 @@ USER appuser
 
 EXPOSE 3000
 
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "dist/main"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:3000/api/health >/dev/null || exit 1
 
-CMD ["node", "dist/main"]
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "--max-old-space-size=1536", "dist/main"]

@@ -368,30 +368,58 @@ export class TaskQueueService {
   /**
    * Release tasks that were claimed but never completed (worker crash).
    * Called periodically by the scheduler service.
+   *
+   * Tasks whose retry count has reached maxRetries are moved to
+   * DEAD_LETTER instead of being re-queued indefinitely.
    */
   async releaseExpiredTaskLeases(): Promise<number> {
     const now = new Date();
-    const result = await this.prisma.task.updateMany({
-      where: {
-        status: { in: ['CLAIMED', 'RUNNING'] },
-        leaseExpiresAt: { lt: now },
-      },
-      data: {
-        status: 'PENDING',
-        claimedBy: null,
-        claimedAt: null,
-        startedAt: null,
-        leaseExpiresAt: null,
-        workerHeartbeatAt: null,
-      },
-    });
 
-    if (result.count > 0) {
+    // Release expired leases back to PENDING with incremented retry count
+    // Uses raw SQL to atomically increment retryCount and compute backoff
+    const released = await this.prisma.$executeRaw`
+      UPDATE "Task"
+      SET
+        status = 'PENDING',
+        "claimedBy" = NULL,
+        "claimedAt" = NULL,
+        "startedAt" = NULL,
+        "leaseExpiresAt" = NULL,
+        "workerHeartbeatAt" = NULL,
+        "retryCount" = "retryCount" + 1,
+        "errorMessage" = 'Worker lease expired (crash or timeout)',
+        "nextRetryAt" = NOW() + (INTERVAL '5 seconds' * POWER(4, "retryCount")),
+        "updatedAt" = NOW()
+      WHERE status IN ('CLAIMED', 'RUNNING')
+        AND "leaseExpiresAt" < ${now}
+        AND "retryCount" < "maxRetries"
+    `;
+
+    // Move exhausted tasks to DEAD_LETTER
+    const deadLettered = await this.prisma.$executeRaw`
+      UPDATE "Task"
+      SET
+        status = 'DEAD_LETTER',
+        "claimedBy" = NULL,
+        "claimedAt" = NULL,
+        "startedAt" = NULL,
+        "leaseExpiresAt" = NULL,
+        "workerHeartbeatAt" = NULL,
+        "retryCount" = "retryCount" + 1,
+        "errorMessage" = 'Worker crashed or timed out (max retries exhausted)',
+        "completedAt" = NOW(),
+        "updatedAt" = NOW()
+      WHERE status IN ('CLAIMED', 'RUNNING')
+        AND "leaseExpiresAt" < ${now}
+    `;
+
+    const total = released + deadLettered;
+    if (total > 0) {
       this.logger.warn(
-        `Released ${result.count} expired task leases back to PENDING`,
+        `Released ${released} expired task leases (${deadLettered} moved to DEAD_LETTER)`,
       );
     }
-    return result.count;
+    return total;
   }
 
   /** Get queue statistics for monitoring */
@@ -407,5 +435,23 @@ export class TaskQueueService {
       ]);
 
     return { pending, claimed, running, completed, failed, deadLetter };
+  }
+
+  /**
+   * Clean up old completed and dead-letter tasks to prevent
+   * unbounded table growth. Retains tasks for the given period.
+   */
+  async cleanupCompletedTasks(retentionMs = 7 * 24 * 3600_000): Promise<number> {
+    const cutoff = new Date(Date.now() - retentionMs);
+    const result = await this.prisma.task.deleteMany({
+      where: {
+        status: { in: ['COMPLETED', 'DEAD_LETTER'] },
+        updatedAt: { lt: cutoff },
+      },
+    });
+    if (result.count > 0) {
+      this.logger.log(`Cleaned up ${result.count} old completed/dead-letter tasks`);
+    }
+    return result.count;
   }
 }

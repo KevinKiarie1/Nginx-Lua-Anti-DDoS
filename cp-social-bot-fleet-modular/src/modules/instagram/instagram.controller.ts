@@ -7,6 +7,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { InstagramService } from './instagram.service';
 import { CreateAccountDto } from '../../common/dto/create-account.dto';
@@ -34,7 +35,7 @@ export class InstagramController {
   }
 
   @Get('accounts/:id')
-  async getAccount(@Param('id') id: string) {
+  async getAccount(@Param('id', ParseUUIDPipe) id: string) {
     return this.instagramService.getAccount(id);
   }
 }

@@ -7,6 +7,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { FacebookService } from './facebook.service';
 import { CreateAccountDto } from '../../common/dto/create-account.dto';
@@ -34,7 +35,7 @@ export class FacebookController {
   }
 
   @Get('accounts/:id')
-  async getAccount(@Param('id') id: string) {
+  async getAccount(@Param('id', ParseUUIDPipe) id: string) {
     return this.facebookService.getAccount(id);
   }
 }

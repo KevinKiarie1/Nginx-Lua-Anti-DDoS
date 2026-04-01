@@ -19,6 +19,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import helmet from 'helmet';
+import * as express from 'express';
 import { AppModule } from './app.module';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
 
@@ -31,6 +32,10 @@ async function bootstrap() {
 
   // Security hardening
   app.use(helmet());
+
+  // Limit request body size to prevent OOM from large payloads
+  app.use(express.json({ limit: '1mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
   // CORS — restrict to configured origins in production
   const allowedOrigins = process.env.CORS_ORIGINS
@@ -58,7 +63,7 @@ async function bootstrap() {
   app.useGlobalFilters(new GlobalExceptionFilter());
 
   const port = process.env.PORT ?? 3000;
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
 
   logger.log('=== CP-SOCIAL-BOT-FLEET-MODULAR ===');
   logger.log(`Modular monolith running on port ${port}`);

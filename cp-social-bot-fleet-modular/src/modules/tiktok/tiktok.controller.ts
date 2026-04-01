@@ -7,6 +7,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { TiktokService } from './tiktok.service';
 import { CreateAccountDto } from '../../common/dto/create-account.dto';
@@ -32,7 +33,7 @@ export class TiktokController {
   }
 
   @Get('accounts/:id')
-  async getAccount(@Param('id') id: string) {
+  async getAccount(@Param('id', ParseUUIDPipe) id: string) {
     return this.tiktokService.getAccount(id);
   }
 }

@@ -19,6 +19,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { ProxyService } from '../proxy/proxy.service';
+import { CryptoService } from '../crypto/crypto.service';
 import * as fs from 'fs';
 import * as path from 'path';
 import UserAgent = require('user-agents');
@@ -42,6 +43,7 @@ export class BrowserService implements OnModuleDestroy {
   constructor(
     private readonly config: ConfigService,
     private readonly proxy: ProxyService,
+    private readonly crypto: CryptoService,
   ) {
     this.sessionDir = this.config.get<string>('app.sessionStorageDir')!;
     this.maxContexts = this.config.get<number>('app.browserMaxContexts')!;
@@ -116,14 +118,22 @@ export class BrowserService implements OnModuleDestroy {
     const ua = new UserAgent({ deviceCategory: 'desktop' });
     const proxyConfig = this.proxy.getProxyForAccount(accountId);
 
-    // Restore previous session state if it exists on disk
-    const sessionPath = path.join(this.sessionDir, `${accountId}.json`);
-    let storageState: string | undefined;
+    // Restore previous session state if it exists on disk (encrypted)
+    const sessionPath = path.join(this.sessionDir, `${accountId}.enc`);
+    let storageState: Record<string, unknown> | undefined;
     if (fs.existsSync(sessionPath)) {
-      storageState = sessionPath;
-      this.logger.debug(
-        `Restoring session state for account ${accountId}`,
-      );
+      try {
+        const encrypted = fs.readFileSync(sessionPath, 'utf8');
+        storageState = JSON.parse(this.crypto.decrypt(encrypted));
+        this.logger.debug(
+          `Restoring encrypted session state for account ${accountId}`,
+        );
+      } catch (err) {
+        this.logger.warn(
+          `Failed to restore session for account ${accountId}, starting fresh`,
+          err,
+        );
+      }
     }
 
     const context = await browser.newContext({
@@ -134,7 +144,7 @@ export class BrowserService implements OnModuleDestroy {
       },
       locale: 'en-US',
       timezoneId: 'America/New_York',
-      ...(storageState ? { storageState } : {}),
+      ...(storageState ? { storageState: storageState as any } : {}),
       ...(proxyConfig
         ? {
             proxy: {
@@ -282,16 +292,17 @@ export class BrowserService implements OnModuleDestroy {
     }
   }
 
-  /** Save a context's cookies/localStorage to disk */
+  /** Save a context's cookies/localStorage to disk (encrypted) */
   private async saveSession(
     accountId: string,
     context: BrowserContext,
   ): Promise<void> {
     try {
-      const sessionPath = path.join(this.sessionDir, `${accountId}.json`);
+      const sessionPath = path.join(this.sessionDir, `${accountId}.enc`);
       const state = await context.storageState();
-      fs.writeFileSync(sessionPath, JSON.stringify(state));
-      this.logger.debug(`Session state saved for account ${accountId}`);
+      const encrypted = this.crypto.encrypt(JSON.stringify(state));
+      fs.writeFileSync(sessionPath, encrypted);
+      this.logger.debug(`Session state saved (encrypted) for account ${accountId}`);
     } catch (err) {
       this.logger.warn(
         `Failed to save session for account ${accountId}`,

@@ -19,6 +19,7 @@ import {
   HttpCode,
   HttpStatus,
   ParseIntPipe,
+  ParseUUIDPipe,
   DefaultValuePipe,
 } from '@nestjs/common';
 import {
@@ -54,14 +55,14 @@ export class SchedulesController {
   }
 
   @Get(':id')
-  async getSchedule(@Param('id') id: string) {
+  async getSchedule(@Param('id', ParseUUIDPipe) id: string) {
     return this.schedulesService.findOne(id);
   }
 
   @Put(':id')
   @RequireHealthy()
   async updateSchedule(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateScheduleDto,
   ) {
     return this.schedulesService.update(id, dto);
@@ -69,7 +70,7 @@ export class SchedulesController {
 
   @Delete(':id')
   @RequireHealthy()
-  async deleteSchedule(@Param('id') id: string) {
+  async deleteSchedule(@Param('id', ParseUUIDPipe) id: string) {
     return this.schedulesService.remove(id);
   }
 }

@@ -18,6 +18,8 @@ import {
 } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
+const isProduction = process.env.NODE_ENV === 'production';
+
 @Injectable()
 export class PrismaService
   extends PrismaClient
@@ -27,17 +29,23 @@ export class PrismaService
 
   constructor() {
     super({
-      log: [
-        { emit: 'event', level: 'query' },
-        { emit: 'stdout', level: 'info' },
-        { emit: 'stdout', level: 'warn' },
-        { emit: 'stdout', level: 'error' },
-      ],
+      log: isProduction
+        ? [
+            { emit: 'stdout', level: 'warn' },
+            { emit: 'stdout', level: 'error' },
+          ]
+        : [
+            { emit: 'event', level: 'query' },
+            { emit: 'stdout', level: 'info' },
+            { emit: 'stdout', level: 'warn' },
+            { emit: 'stdout', level: 'error' },
+          ],
+      datasourceUrl: process.env.DATABASE_URL,
     });
   }
 
   async onModuleInit() {
-    await this.$connect();
+    await this.connectWithRetry();
     this.logger.log(
       'Database connected (CockroachDB — SERIALIZABLE isolation)',
     );
@@ -46,5 +54,34 @@ export class PrismaService
   async onModuleDestroy() {
     await this.$disconnect();
     this.logger.log('Database disconnected');
+  }
+
+  /**
+   * Retry connection with exponential backoff.
+   * In production, the database may not be ready immediately
+   * after container startup (especially with CockroachDB init).
+   */
+  private async connectWithRetry(
+    maxAttempts = 5,
+    baseDelayMs = 2000,
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.$connect();
+        return;
+      } catch (error) {
+        if (attempt === maxAttempts) {
+          this.logger.error(
+            `Database connection failed after ${maxAttempts} attempts`,
+          );
+          throw error;
+        }
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        this.logger.warn(
+          `Database connection attempt ${attempt}/${maxAttempts} failed, retrying in ${delay}ms...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
   }
 }

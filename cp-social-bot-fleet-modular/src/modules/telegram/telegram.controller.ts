@@ -14,6 +14,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { TelegramService } from './telegram.service';
 import { CreateAccountDto } from '../../common/dto/create-account.dto';
@@ -39,7 +40,7 @@ export class TelegramController {
   }
 
   @Get('accounts/:id')
-  async getAccount(@Param('id') id: string) {
+  async getAccount(@Param('id', ParseUUIDPipe) id: string) {
     return this.telegramService.getAccount(id);
   }
 }

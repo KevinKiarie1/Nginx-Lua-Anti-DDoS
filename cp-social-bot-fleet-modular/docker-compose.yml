@@ -10,8 +10,6 @@
 # of our CP guarantees.
 # ============================================================
 
-version: '3.9'
-
 services:
   # ── CockroachDB — CP-Consistent Database ─────────────────
   cockroachdb:
