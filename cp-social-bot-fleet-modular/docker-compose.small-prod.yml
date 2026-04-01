@@ -1,0 +1,156 @@
+# ============================================================
+# Docker Compose — Small Production (4 vCPU / 8 GB VM)
+# ============================================================
+# Minimal topology that retains CP consistency guarantees:
+#
+#   cockroach     — single-node CockroachDB (insecure, no certs)
+#   app-api       — Telegram + REST API (no browser, lightweight)
+#   app-browser   — TikTok/Instagram/Facebook (Playwright worker)
+#
+# Resource budget (~3.5 GB container RAM on an 8 GB VM):
+#   cockroach   :  1.0 vCPU / 768 MB
+#   app-api     :  0.5 vCPU / 384 MB
+#   app-browser :  2.0 vCPU / 2.0 GB
+#   OS + buffer :  0.5 vCPU / ~4.8 GB headroom
+#
+# The split keeps the control plane (API, scheduler, Telegram)
+# independent of the heavy browser worker. If the browser
+# container OOMs or restarts, the API and Telegram stay up.
+#
+# Usage:
+#   docker compose -f docker-compose.small-prod.yml up --build -d
+#   docker compose -f docker-compose.small-prod.yml logs -f
+# ============================================================
+
+services:
+  # ── Database ─────────────────────────────────────────────
+  cockroach:
+    image: cockroachdb/cockroach:v23.2.0
+    command: >-
+      start-single-node --insecure
+      --store=path=/cockroach/cockroach-data
+      --cache=192MiB
+      --max-sql-memory=192MiB
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'cockroach sql --insecure --host=localhost:26257 -e "SELECT 1" >/dev/null 2>&1 || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+    networks:
+      - botnet
+
+  # ── Bootstrap: create DB + user ──────────────────────────
+  cockroach-init:
+    image: cockroachdb/cockroach:v23.2.0
+    depends_on:
+      cockroach:
+        condition: service_healthy
+    command: >
+      sql --insecure --host=cockroach:26257 -e
+      "CREATE DATABASE IF NOT EXISTS social_bot_fleet;
+       CREATE USER IF NOT EXISTS bot_user;
+       GRANT ALL ON DATABASE social_bot_fleet TO bot_user;"
+    restart: 'no'
+    networks:
+      - botnet
+
+  # ── One-shot migration ───────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.small-api
+    depends_on:
+      cockroach-init:
+        condition: service_completed_successfully
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    restart: 'no'
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: '0.5'
+    networks:
+      - botnet
+
+  # ── App: Telegram + REST API (no browser) ────────────────
+  app-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.small-api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - '3000:3000'
+    volumes:
+      - app-sessions:/app/data/sessions
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS -H "X-Api-Key: $$API_KEY" http://localhost:3000/api/health >/dev/null || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+    networks:
+      - botnet
+
+  # ── App: Browser worker (TikTok/Instagram/Facebook) ──────
+  app-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.small-browser
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - app-sessions:/app/data/sessions
+    # SHM size needed for Chromium — prevents crashes on small VMs
+    shm_size: '256m'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS -H "X-Api-Key: $$API_KEY" http://localhost:3000/api/health >/dev/null || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+    networks:
+      - botnet
+
+volumes:
+  cockroach-data:
+  app-sessions:
+
+networks:
+  botnet:
+    driver: bridge

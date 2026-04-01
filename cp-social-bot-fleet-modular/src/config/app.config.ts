@@ -94,6 +94,11 @@ export const appConfig = registerAs('app', () => ({
   // Browser automation
   browserHeadless: process.env.BROWSER_HEADLESS !== 'false',
   browserSlowMo: parseInt(process.env.BROWSER_SLOW_MO ?? '50', 10),
+  browserMaxContexts: parseInt(process.env.BROWSER_MAX_CONTEXTS ?? '3', 10),
+  browserContextIdleMs: parseInt(
+    process.env.BROWSER_CONTEXT_IDLE_MS ?? '600000',
+    10,
+  ),
 
   // Session persistence (browser contexts saved to disk for reuse)
   sessionStorageDir: process.env.SESSION_STORAGE_DIR ?? './data/sessions',

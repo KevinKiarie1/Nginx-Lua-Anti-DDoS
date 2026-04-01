@@ -23,25 +23,48 @@ import * as fs from 'fs';
 import * as path from 'path';
 import UserAgent = require('user-agents');
 
+/** Tracked browser context with last-used timestamp for LRU eviction */
+interface TrackedContext {
+  context: BrowserContext;
+  lastUsedAt: number;
+}
+
 @Injectable()
 export class BrowserService implements OnModuleDestroy {
   private readonly logger = new Logger(BrowserService.name);
   private browser: Browser | null = null;
-  private readonly contexts = new Map<string, BrowserContext>();
+  private readonly contexts = new Map<string, TrackedContext>();
   private readonly sessionDir: string;
+  private readonly maxContexts: number;
+  private readonly contextIdleMs: number;
+  private evictionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly config: ConfigService,
     private readonly proxy: ProxyService,
   ) {
     this.sessionDir = this.config.get<string>('app.sessionStorageDir')!;
+    this.maxContexts = this.config.get<number>('app.browserMaxContexts')!;
+    this.contextIdleMs = this.config.get<number>('app.browserContextIdleMs')!;
+
     // Ensure session directory exists
     if (!fs.existsSync(this.sessionDir)) {
       fs.mkdirSync(this.sessionDir, { recursive: true });
     }
+
+    // Sweep idle contexts every 60 seconds
+    this.evictionTimer = setInterval(() => {
+      this.evictIdleContexts().catch((err) =>
+        this.logger.warn('Context eviction sweep failed', err),
+      );
+    }, 60_000);
   }
 
   async onModuleDestroy() {
+    if (this.evictionTimer) {
+      clearInterval(this.evictionTimer);
+      this.evictionTimer = null;
+    }
     await this.closeAll();
   }
 
@@ -71,11 +94,23 @@ export class BrowserService implements OnModuleDestroy {
    * Create a stealth browser context for a specific account.
    * Each account gets its own isolated context with a unique
    * fingerprint — preventing cross-account correlation.
+   *
+   * LRU eviction: If the context pool is at capacity, the
+   * least-recently-used context is saved and closed before
+   * creating a new one.
    */
   async createStealthContext(accountId: string): Promise<BrowserContext> {
     // Reuse existing context for this account
     const existing = this.contexts.get(accountId);
-    if (existing) return existing;
+    if (existing) {
+      existing.lastUsedAt = Date.now();
+      return existing.context;
+    }
+
+    // Evict LRU context if at capacity
+    if (this.contexts.size >= this.maxContexts) {
+      await this.evictLru();
+    }
 
     const browser = await this.getBrowser();
     const ua = new UserAgent({ deviceCategory: 'desktop' });
@@ -157,32 +192,41 @@ export class BrowserService implements OnModuleDestroy {
       window.chrome = { runtime: {} };
     `);
 
-    this.contexts.set(accountId, context);
-    this.logger.debug(`Stealth context created for account ${accountId}`);
+    this.contexts.set(accountId, {
+      context,
+      lastUsedAt: Date.now(),
+    });
+    this.logger.debug(
+      `Stealth context created for account ${accountId} ` +
+        `(${this.contexts.size}/${this.maxContexts} slots)`,
+    );
     return context;
   }
 
   /** Create a new page in an account's stealth context */
   async createPage(accountId: string): Promise<Page> {
     const context = await this.createStealthContext(accountId);
+    // Touch LRU timestamp on every page creation
+    const tracked = this.contexts.get(accountId);
+    if (tracked) tracked.lastUsedAt = Date.now();
     return context.newPage();
   }
 
   /** Close a specific account's context, persisting session state */
   async closeContext(accountId: string): Promise<void> {
-    const context = this.contexts.get(accountId);
-    if (context) {
-      await this.saveSession(accountId, context);
-      await context.close();
+    const tracked = this.contexts.get(accountId);
+    if (tracked) {
+      await this.saveSession(accountId, tracked.context);
+      await tracked.context.close();
       this.contexts.delete(accountId);
     }
   }
 
   /** Close all contexts and the browser, persisting all sessions */
   async closeAll(): Promise<void> {
-    for (const [id, ctx] of this.contexts) {
-      await this.saveSession(id, ctx).catch(() => {});
-      await ctx.close().catch(() => {});
+    for (const [id, tracked] of this.contexts) {
+      await this.saveSession(id, tracked.context).catch(() => {});
+      await tracked.context.close().catch(() => {});
       this.contexts.delete(id);
     }
     if (this.browser) {
@@ -190,6 +234,52 @@ export class BrowserService implements OnModuleDestroy {
       this.browser = null;
     }
     this.logger.log('Browser and all contexts closed (sessions saved)');
+  }
+
+  // ── LRU / Idle context eviction ───────────────────────
+
+  /** Evict the single least-recently-used context to free a slot */
+  private async evictLru(): Promise<void> {
+    let oldestId: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [id, tracked] of this.contexts) {
+      if (tracked.lastUsedAt < oldestTime) {
+        oldestTime = tracked.lastUsedAt;
+        oldestId = id;
+      }
+    }
+
+    if (oldestId) {
+      this.logger.log(`Evicting LRU context for account ${oldestId}`);
+      await this.closeContext(oldestId);
+    }
+  }
+
+  /** Periodic sweep: close contexts that have been idle beyond the TTL */
+  private async evictIdleContexts(): Promise<void> {
+    const now = Date.now();
+    const toEvict: string[] = [];
+
+    for (const [id, tracked] of this.contexts) {
+      if (now - tracked.lastUsedAt > this.contextIdleMs) {
+        toEvict.push(id);
+      }
+    }
+
+    for (const id of toEvict) {
+      this.logger.log(`Evicting idle context for account ${id}`);
+      await this.closeContext(id).catch((err) =>
+        this.logger.warn(`Failed to evict context ${id}`, err),
+      );
+    }
+
+    if (toEvict.length > 0) {
+      this.logger.log(
+        `Evicted ${toEvict.length} idle context(s), ` +
+          `${this.contexts.size}/${this.maxContexts} slots in use`,
+      );
+    }
   }
 
   /** Save a context's cookies/localStorage to disk */
